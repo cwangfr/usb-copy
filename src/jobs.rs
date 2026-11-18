@@ -1,6 +1,6 @@
 use crate::{
     copy::{self, Phase, Settings},
-    volume::{self, Session, Volume},
+    volume::{self, Maintenance, Session, Volume},
 };
 use std::{
     ffi::{OsStr, OsString},
@@ -70,6 +70,7 @@ pub enum Job {
         expected: Option<copy::Hash>,
     },
     Verify(PathBuf),
+    Device(Maintenance),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +106,11 @@ impl Report {
 pub fn run(volume: &Volume, base: &Path, job: Job, monitor: &Monitor) -> Report {
     let mut report = Report::default();
     let result = (|| {
+        if let Job::Device(operation) = job {
+            monitor.update(operation.progress(), &volume.mount, 0, 0)?;
+            report.row(&volume.mount, Outcome::Passed, volume.maintain(operation)?);
+            return Ok(());
+        }
         monitor.update("正在检查 U 盘", base, 0, 0)?;
         let session = Session::open(volume)?;
         session.guard()?;
@@ -161,6 +167,7 @@ pub fn run(volume: &Volume, base: &Path, job: Job, monitor: &Monitor) -> Report 
                     &mut report,
                 )
             }
+            Job::Device(_) => unreachable!("handled before opening a file session"),
         }
     })();
     if let Err(error) = result {
@@ -619,6 +626,58 @@ pub fn temp_name(name: &OsStr) -> bool {
 mod tests {
     use super::*;
     use std::fs::File;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "copies and re-reads a file over 4 GiB"]
+    fn exfat_policy_allows_and_verifies_a_file_over_four_gib() -> io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let disk = tempfile::tempdir()?;
+        let local = tempfile::tempdir()?;
+        let mut volume = Volume::test_volume(disk.path())?;
+        let source = local.path().join("large.bin");
+        let end = 1u64 << 32;
+        let mut input = File::create(&source)?;
+        input.seek(SeekFrom::Start(end))?;
+        input.write_all(b"verified beyond four GiB")?;
+        drop(input);
+        let copy = |volume: &Volume| {
+            run(
+                volume,
+                Path::new(""),
+                Job::Copy {
+                    sources: vec![source.clone()],
+                    settings: Settings {
+                        block_mib: 8,
+                        sync_mib: 0,
+                    },
+                    rename: false,
+                },
+                &Monitor::default(),
+            )
+        };
+        volume.filesystem = "vfat".to_owned();
+        assert_eq!(copy(&volume).rows[0].outcome, Outcome::Failed);
+        assert!(!disk.path().join("large.bin").exists());
+
+        volume.filesystem = "exfat".to_owned();
+        let report = copy(&volume);
+        assert_eq!(
+            report.rows[0].outcome,
+            Outcome::Passed,
+            "{}",
+            report.rows[0].detail
+        );
+        assert_eq!(report.hashes.len(), 1);
+        let mut output = File::open(disk.path().join("large.bin"))?;
+        assert_eq!(output.metadata()?.len(), fs::metadata(&source)?.len());
+        output.seek(SeekFrom::Start(end))?;
+        let mut tail = Vec::new();
+        output.read_to_end(&mut tail)?;
+        assert_eq!(tail, b"verified beyond four GiB");
+        Ok(())
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

@@ -15,7 +15,7 @@ use std::{
 use usb_copy::{
     copy::Settings,
     jobs::{self, Job, Monitor, Outcome, Report},
-    volume::{self, Session, Volume},
+    volume::{self, Maintenance, Session, Volume},
 };
 
 struct Entry {
@@ -38,6 +38,7 @@ struct ActiveJob {
     receive: Receiver<Report>,
     action: &'static str,
     base: PathBuf,
+    device_operation: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +61,8 @@ pub struct App {
     show_settings: bool,
     show_license: bool,
     confirm_delete: bool,
+    confirm_device: Option<(Maintenance, Volume)>,
+    format_confirmation: String,
     show_hash: bool,
     expected: String,
     path_input: Option<(PathAction, String)>,
@@ -108,6 +111,8 @@ impl App {
             show_settings: false,
             show_license: false,
             confirm_delete: false,
+            confirm_device: None,
+            format_confirmation: String::new(),
             show_hash: false,
             expected: String::new(),
             path_input: None,
@@ -169,7 +174,12 @@ impl App {
         let Some(volume) = self.current().cloned() else {
             return;
         };
-        let job_base = self.listing.folder.clone();
+        let device_operation = matches!(job, Job::Device(_));
+        let job_base = if device_operation {
+            PathBuf::new()
+        } else {
+            self.listing.folder.clone()
+        };
         let base = volume.mount.join(&job_base);
         let monitor = Arc::new(Monitor::default());
         let worker_monitor = monitor.clone();
@@ -184,6 +194,7 @@ impl App {
             receive,
             action,
             base,
+            device_operation,
         });
         self.status.clear();
         self.issue = false;
@@ -219,7 +230,9 @@ impl App {
         if context.input(|input| input.viewport().close_requested()) {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.exit_after_task = true;
-            active.monitor.cancel.store(true, Ordering::Relaxed);
+            if !active.device_operation {
+                active.monitor.cancel.store(true, Ordering::Relaxed);
+            }
         }
         match active.receive.try_recv() {
             Ok(report) => {
@@ -241,11 +254,16 @@ impl App {
                     "{}{state} · 成功 {passed} · 跳过 {skipped} · 失败 {failed}",
                     active.action
                 );
+                if active.device_operation
+                    && let Some(row) = report.rows.first()
+                {
+                    self.status = row.detail.clone();
+                }
                 if !report.cancelled
                     && (active.action == "复制" || active.action == "删除")
                     && passed > 0
                 {
-                    self.status.push_str("。拔盘前请通过系统安全弹出");
+                    self.status.push_str("。拔盘前请选择「安全弹出」");
                 }
                 self.issue = failed > 0;
                 self.report_base = active.base.clone();
@@ -295,7 +313,7 @@ impl App {
 
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("U 盘复制工具").size(25.0).strong());
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("目标 U 盘").strong());
             let previous = self.listing.selected;
             let mut selected = previous;
@@ -334,6 +352,20 @@ impl App {
                     volume.filesystem.to_uppercase(),
                     size(volume.available)
                 ));
+            }
+        });
+        ui.horizontal(|ui| {
+            let ready = self.active.is_none() && self.browse.is_none() && self.current().is_some();
+            for (operation, label) in [
+                (Maintenance::Eject, "安全弹出…"),
+                (Maintenance::FormatExfat, "格式化…"),
+            ] {
+                if ui.add_enabled(ready, egui::Button::new(label)).clicked()
+                    && let Some(volume) = self.current().cloned()
+                {
+                    self.format_confirmation.clear();
+                    self.confirm_device = Some((operation, volume));
+                }
             }
         });
     }
@@ -517,7 +549,9 @@ impl App {
             let cancelled = active.monitor.cancel.load(Ordering::Relaxed);
             ui.horizontal(|ui| {
                 ui.spinner();
-                let label = if cancelled {
+                let label = if self.exit_after_task && active.device_operation {
+                    "操作结束后将关闭窗口"
+                } else if cancelled {
                     "正在取消，等待当前操作结束"
                 } else {
                     progress.stage
@@ -542,7 +576,10 @@ impl App {
             }
         } else if !self.status.is_empty() {
             if self.issue {
-                ui.colored_label(error_color(ui), &self.status);
+                ui.add(
+                    egui::Label::new(RichText::new(&self.status).color(error_color(ui))).truncate(),
+                )
+                .on_hover_text(&self.status);
             } else {
                 ui.label(&self.status);
             }
@@ -565,12 +602,13 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(active) = &self.active {
-                    if ui
-                        .add_enabled(
-                            !active.monitor.cancel.load(Ordering::Relaxed),
-                            egui::Button::new("取消任务"),
-                        )
-                        .clicked()
+                    if !active.device_operation
+                        && ui
+                            .add_enabled(
+                                !active.monitor.cancel.load(Ordering::Relaxed),
+                                egui::Button::new("取消任务"),
+                            )
+                            .clicked()
                     {
                         active.monitor.cancel.store(true, Ordering::Relaxed);
                     }
@@ -597,6 +635,7 @@ impl App {
     }
 
     fn dialogs(&mut self, context: &egui::Context) {
+        self.device_dialog(context);
         if self.confirm_delete {
             let names = self.names();
             let response = egui::Modal::new(egui::Id::new("confirm_delete")).show(context, |ui| {
@@ -788,6 +827,71 @@ impl App {
             }
         }
         self.path_dialog(context);
+    }
+
+    fn device_dialog(&mut self, context: &egui::Context) {
+        let Some((operation, selected)) = &self.confirm_device else {
+            return;
+        };
+        let operation = *operation;
+        let same = self.current().is_some_and(|current| current.same(selected))
+            && self.active.is_none()
+            && self.browse.is_none();
+        let formatting = operation == Maintenance::FormatExfat;
+        let title = if formatting {
+            "格式化为 exFAT？"
+        } else {
+            "安全弹出 U 盘？"
+        };
+        let response = egui::Modal::new(egui::Id::new("device_operation")).show(context, |ui| {
+            ui.heading(title);
+            ui.label(format!(
+                "{}  ·  {}  ·  {}",
+                selected.label,
+                selected.mount.display(),
+                selected.filesystem.to_uppercase()
+            ));
+            if formatting {
+                ui.colored_label(
+                    error_color(ui),
+                    "所选卷上的文件将被删除。exFAT 支持超过 4 GiB 的单个文件。",
+                );
+                #[cfg(windows)]
+                ui.weak("Windows 上需要以管理员身份启动本程序。");
+                ui.label("输入 FORMAT 以确认。");
+                ui.text_edit_singleline(&mut self.format_confirmation);
+            } else {
+                ui.label("将弹出整台 USB 设备。请等到系统确认后再拔出。");
+            }
+            ui.horizontal(|ui| {
+                let cancel = ui.button("取消").clicked();
+                let button = if formatting {
+                    RichText::new("格式化").color(error_color(ui))
+                } else {
+                    RichText::new("安全弹出")
+                };
+                let start = ui
+                    .add_enabled(
+                        same && (!formatting || self.format_confirmation == "FORMAT"),
+                        egui::Button::new(button),
+                    )
+                    .clicked();
+                (cancel, start)
+            })
+            .inner
+        });
+        let (cancel, start) = response.inner;
+        if start {
+            let action = if formatting {
+                "格式化"
+            } else {
+                "安全弹出"
+            };
+            self.start(context, action, Job::Device(operation));
+        }
+        if cancel || start || response.should_close() {
+            self.confirm_device = None;
+        }
     }
 
     fn path_dialog(&mut self, context: &egui::Context) {

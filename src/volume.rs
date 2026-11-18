@@ -14,6 +14,21 @@ mod platform;
 
 pub use platform::{Session, Volume, detect};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Maintenance {
+    FormatExfat,
+    Eject,
+}
+
+impl Maintenance {
+    pub fn progress(self) -> &'static str {
+        match self {
+            Self::FormatExfat => "正在格式化为 exFAT",
+            Self::Eject => "正在安全弹出",
+        }
+    }
+}
+
 pub struct Folder {
     path: PathBuf,
     _handles: Vec<File>,

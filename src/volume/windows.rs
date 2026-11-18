@@ -1,4 +1,4 @@
-use super::{Folder, changed, parts};
+use super::{Folder, Maintenance, changed, parts};
 use std::{
     env,
     ffi::{OsStr, OsString},
@@ -9,11 +9,16 @@ use std::{
         ffi::{OsStrExt, OsStringExt},
         fs::OpenOptionsExt,
         io::AsRawHandle,
+        process::CommandExt,
     },
     path::{Path, PathBuf},
+    process::Command,
     ptr::null_mut,
 };
 use windows_sys::Win32::{
+    Devices::DeviceAndDriverInstallation::{
+        CM_Get_Device_IDW, CM_Get_Parent, CM_Locate_DevNodeW, CM_Request_Device_EjectW, CR_SUCCESS,
+    },
     Storage::FileSystem::{
         BusTypeUsb, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
         FILE_SHARE_READ, FILE_SHARE_WRITE, GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives,
@@ -26,6 +31,7 @@ use windows_sys::Win32::{
             IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR,
             STORAGE_PROPERTY_QUERY, StorageDeviceProperty, VOLUME_DISK_EXTENTS,
         },
+        SystemInformation::GetSystemDirectoryW,
         WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOVABLE},
     },
 };
@@ -201,6 +207,148 @@ impl Volume {
     pub fn same(&self, other: &Self) -> bool {
         self.mount == other.mount && self.guid == other.guid && self.serial == other.serial
     }
+
+    pub fn maintain(&self, operation: Maintenance) -> io::Result<String> {
+        let drive = self.mount.to_string_lossy();
+        let letter = drive
+            .as_bytes()
+            .first()
+            .copied()
+            .filter(u8::is_ascii_uppercase)
+            .ok_or_else(changed)?;
+        let drive_name = format!("{}:", char::from(letter));
+        let verify = || {
+            if !is_usb(&drive_name) || !self.same(&inspect(&self.mount).map_err(|_| changed())?) {
+                return Err(changed());
+            }
+            Ok(())
+        };
+        verify()?;
+        let script = match operation {
+            Maintenance::FormatExfat => {
+                r#"
+                $principal = [Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+                if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+                    throw 'Reopen USB Copy as administrator to format a volume.'
+                }
+                $formatted = Format-Volume -InputObject $volume -FileSystem exFAT -Confirm:$false
+                if ($formatted.FileSystem -ine 'exFAT') { throw 'exFAT format could not be verified.' }
+                Write-Output 'exFAT'
+            "#
+            }
+            Maintenance::Eject => {
+                r#"
+                $physical = @(Get-CimInstance -ClassName Win32_DiskDrive -Filter ("Index = " + [uint32]$disk.Number))
+                if ($physical.Count -ne 1 -or !$physical[0].PNPDeviceID) { throw 'Cannot identify the USB device.' }
+                Write-Output $physical[0].PNPDeviceID
+            "#
+            }
+        };
+        let output = powershell(letter, self.guid.as_os_str(), script)?;
+        match operation {
+            Maintenance::FormatExfat if output.eq_ignore_ascii_case("exfat") => {
+                Ok("已格式化为 exFAT".to_owned())
+            }
+            Maintenance::FormatExfat => Err(io::Error::other("Windows 未确认 exFAT 格式化结果")),
+            Maintenance::Eject => {
+                let device = usb_devnode(&output)?;
+                verify()?;
+                let mut veto = 0;
+                let mut owner = [0; 260];
+                let status = unsafe {
+                    CM_Request_Device_EjectW(
+                        device,
+                        &mut veto,
+                        owner.as_mut_ptr(),
+                        owner.len() as u32,
+                        0,
+                    )
+                };
+                if status != CR_SUCCESS {
+                    return Err(io::Error::other(format!(
+                        "Windows 拒绝安全弹出，请关闭使用该设备的程序。状态 0x{status:X}，原因 {veto} {}",
+                        from_wide(&owner).to_string_lossy()
+                    )));
+                }
+                Ok("U 盘已安全弹出，可以拔出".to_owned())
+            }
+        }
+    }
+}
+
+fn powershell(letter: u8, guid: &OsStr, operation: &str) -> io::Result<String> {
+    // Use the system copy rather than searching the current directory or PATH.
+    let mut directory = [0; 32768];
+    let length =
+        unsafe { GetSystemDirectoryW(directory.as_mut_ptr(), directory.len() as u32) } as usize;
+    if length == 0 || length >= directory.len() {
+        return Err(io::Error::last_os_error());
+    }
+    let exe = PathBuf::from(OsString::from_wide(&directory[..length]))
+        .join(r"WindowsPowerShell\v1.0\powershell.exe");
+    let checks = r#"
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        $expected = $env:USB_COPY_VOLUME_GUID
+        $partition = Get-Partition -DriveLetter ([char]$env:USB_COPY_DRIVE_LETTER)
+        if ($partition.AccessPaths -inotcontains $expected) { throw 'The selected volume changed.' }
+        $disk = Get-Disk -Number $partition.DiskNumber
+        if ($disk.BusType -ine 'USB' -or $disk.IsSystem -or $disk.IsBoot) { throw 'This is not a non-system USB disk.' }
+        $volume = Get-Volume -Path $expected
+        if ($volume.Path -ine $expected) { throw 'The selected volume changed.' }
+    "#;
+    let output = Command::new(exe)
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(format!("{checks}\n{operation}"))
+        .env("USB_COPY_DRIVE_LETTER", char::from(letter).to_string())
+        .env("USB_COPY_VOLUME_GUID", guid)
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::other(format!(
+            "Windows 存储操作失败：{}",
+            error.trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn usb_devnode(id: &str) -> io::Result<u32> {
+    // Resolve the first physical USB device above the storage LUN, never the USB hub.
+    if id.is_empty() || id.contains(['\0', '\n', '\r']) {
+        return Err(io::Error::other("Windows 未返回单一的 USB 存储设备"));
+    }
+    let missing = || io::Error::other("无法识别可安全弹出的 USB 设备");
+    let mut node = 0;
+    let id = wide(OsStr::new(id));
+    if unsafe { CM_Locate_DevNodeW(&mut node, id.as_ptr(), 0) } != CR_SUCCESS {
+        return Err(missing());
+    }
+    for _ in 0..12 {
+        let mut buffer = [0; 260];
+        if unsafe { CM_Get_Device_IDW(node, buffer.as_mut_ptr(), buffer.len() as u32, 0) }
+            != CR_SUCCESS
+        {
+            break;
+        }
+        let identity = from_wide(&buffer).to_string_lossy().to_ascii_uppercase();
+        if identity.starts_with(r"USB\VID_")
+            && !identity
+                .split('\\')
+                .nth(1)
+                .is_some_and(|kind| kind.contains("&MI_"))
+        {
+            return Ok(node);
+        }
+        let mut parent = 0;
+        if unsafe { CM_Get_Parent(&mut parent, node, 0) } != CR_SUCCESS {
+            break;
+        }
+        node = parent;
+    }
+    Err(missing())
 }
 
 pub struct Session {
