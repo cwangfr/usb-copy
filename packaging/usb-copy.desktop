@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=USB Copy
+Name[zh_CN]=U 盘复制工具
+Comment=Copy files to a USB drive and verify them with SHA-256
+Comment[zh_CN]=复制文件到 U 盘并进行 SHA-256 校验
+Exec=usb-copy
+Icon=usb-copy
+Terminal=false
+Categories=Utility;FileTools;
+StartupWMClass=usb-copy
